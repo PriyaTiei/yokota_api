@@ -1,0 +1,2 @@
+PORT=8127
+YOKOTA_DATA_PATH=/mnt/yokota/AppData
