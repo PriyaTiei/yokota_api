@@ -219,6 +219,15 @@ async function readCSVFile(filePath, filterWindow) {
             const trimmed = line.trim();
             if (!trimmed) return;
 
+            // Skip angle/torque curve points, headers, and comments embedded in Yokota logs
+            if (trimmed.startsWith('@') || 
+                trimmed.startsWith('FreeRun:') || 
+                trimmed.startsWith('Final:') || 
+                trimmed.startsWith('Trq,') || 
+                /^[-\d.,]+$/.test(trimmed)) {
+                return;
+            }
+
             // Stream-level window filtering: skip object allocation for lines outside window
             if (filterWindow) {
                 const spaceIdx = trimmed.lastIndexOf(' ');
@@ -236,25 +245,25 @@ async function readCSVFile(filePath, filterWindow) {
 
             const fields = trimmed.split(/\s+/);
             if (fields.length >= 11) {
-                results.push({
-                    folder: fields[0] || '',
-                    program: fields[1] || '',
-                    unknownValue1: fields[2] || '',
-                    torqueDuplicate: fields[3] || '',
-                    unknownValue2: fields[4] || '',
-                    unknownValue3: fields[5] || '',
-                    unknownValue4: fields[6] || '',
-                    unknownValue5: fields[7] || '',
-                    torque: fields[8] || '',
-                    judgement: fields[9] || '',
-                    timeDate: fields.slice(10).join(' ') || ''
-                });
-            } else if (fields.length > 0) {
-                results.push({
-                    error: 'Unexpected format',
-                    fieldCount: fields.length,
-                    fields: fields
-                });
+                const folder = fields[0] || '';
+                const timeDate = fields.slice(10).join(' ') || '';
+                const torque = fields[8] || '';
+
+                if (folder && timeDate && torque) {
+                    results.push({
+                        folder: folder,
+                        program: fields[1] || '',
+                        unknownValue1: fields[2] || '',
+                        torqueDuplicate: fields[3] || '',
+                        unknownValue2: fields[4] || '',
+                        unknownValue3: fields[5] || '',
+                        unknownValue4: fields[6] || '',
+                        unknownValue5: fields[7] || '',
+                        torque: torque,
+                        judgement: fields[9] || '',
+                        timeDate: timeDate
+                    });
+                }
             }
         });
 
