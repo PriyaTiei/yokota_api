@@ -21,6 +21,8 @@ const DEFAULT_STATION_MAPPING = {
     '20': ['0257'],         // VVT Bolt Tightening (257)
     '17': ['0039'],         // Water Bypass Outlet Bolt (39)
     'Cam housing sub assy': ['0257'],
+    'Cam housing': ['0257'],
+    'CAM_HOUSING': ['0257'],
     'CHS': ['0257']
 };
 
@@ -170,8 +172,18 @@ async function resolveStationDetails(station, folder) {
         }
     } else if (station != null) {
         const stnKey = station.toString().trim();
-        const mapped = DEFAULT_STATION_MAPPING[stnKey] || DEFAULT_STATION_MAPPING[parseInt(stnKey)];
+        let mapped = DEFAULT_STATION_MAPPING[stnKey] || DEFAULT_STATION_MAPPING[parseInt(stnKey, 10)];
         
+        if (!mapped) {
+            const norm = stnKey.toLowerCase().replace(/[\s_-]+/g, '');
+            for (const [k, v] of Object.entries(DEFAULT_STATION_MAPPING)) {
+                if (k.toLowerCase().replace(/[\s_-]+/g, '') === norm) {
+                    mapped = v;
+                    break;
+                }
+            }
+        }
+
         if (mapped) {
             const list = Array.isArray(mapped) ? mapped : [mapped];
             list.forEach(c => {
