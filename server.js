@@ -8,7 +8,8 @@ const readline = require('readline');
 const app = express();
 const PORT = process.env.PORT || 8127;
 
-// Default Station to Folder ID mappings based on production controller status sheet
+// Station → controller folder mapping (4-digit padded folder IDs)
+// These are the directory names directly under /mnt/yokota/AppData/
 const DEFAULT_STATION_MAPPING = {
     '61': ['0255', '0102'], // EGR Pipe (255) & I/M Bracket Bolt (102)
     '60': ['0240'],         // EGR Valve (240)
@@ -26,18 +27,30 @@ const DEFAULT_STATION_MAPPING = {
     'CHS': ['0257']
 };
 
-// Known default controller IP subfolders
+// Controller folder → IP-based subfolder FAST-PATH hints.
+//
+// IMPORTANT: The actual on-disk subfolder name is built from the controller's OWN numeric ID,
+// not from a separate IP address tail.  The real layout under /mnt/yokota/AppData/ is:
+//
+//   <4-digit-folder>/120_0_100_<stripped-numeric>/<date>/<file>.csv
+//
+// e.g.  0053 → 0053/120_0_100_53/20260819/0053_120_0_100_53_20260819.csv
+//        0039 → 0039/120_0_100_39/20260819/0039_120_0_100_39_20260819.csv
+//
+// If the hinted subfolder does not exist the code falls back to scanning the controller
+// directory for any subdirectory that contains the requested date folder.
+// Keys are 4-digit padded folder IDs.
 const DEFAULT_SUBFOLDER_MAPPING = {
-    '0039': '120_0_100_95',
-    '0053': '120_0_100_94',
-    '0102': '120_0_100_93',
-    '0103': '120_0_100_92',
-    '0104': '120_0_100_91',
-    '0230': '120_0_100_97',
-    '0240': '120_0_100_99',
-    '0250': '120_0_100_98',
-    '0255': '120_0_100_96',
-    '0257': '120_0_100_78'
+    '0039': '120_0_100_39',
+    '0053': '120_0_100_53',
+    '0102': '120_0_100_102',
+    '0103': '120_0_100_103',
+    '0104': '120_0_100_104',
+    '0230': '120_0_100_230',
+    '0240': '120_0_100_240',
+    '0250': '120_0_100_250',
+    '0255': '120_0_100_255',
+    '0257': '120_0_100_257'
 };
 
 app.use(express.json());
@@ -211,6 +224,80 @@ async function resolveStationDetails(station, folder) {
 const foundFilesCache = new Map();
 const FILES_CACHE_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * Parse a single Yokota CSV data line into a structured record.
+ *
+ * Line format (space-separated, 13 fields):
+ *   field 0  : controllerId   e.g. "i0053"  — raw device-emitted controller identity
+ *   field 1  : folder         e.g. "1a"     — internal spindle / head number
+ *   field 2  : program        e.g. "657-"
+ *   field 3  : unknownValue1  e.g. "5A"
+ *   field 4  : torqueDuplicate e.g. "27.9K"
+ *   field 5  : unknownValue2  e.g. "4385"
+ *   field 6  : unknownValue3  e.g. "17"
+ *   field 7  : unknownValue4  e.g. "96"
+ *   field 8  : unknownValue5  e.g. "32"
+ *   field 9  : torque         e.g. "8"
+ *   field 10 : judgement      e.g. "Aok"
+ *   field 11 : date           e.g. "08/19"
+ *   field 12 : time           e.g. "08:45:17"
+ *
+ * CRITICAL: "folder" in the response is fields[1] (the internal spindle ID like "1a"),
+ * NOT fields[0] (the controller ID like "i0053").  Controller identity comes from the
+ * file path / directory name.
+ */
+function parseYokotaLine(trimmed) {
+    // Skip angle-curve data, graph headers, summary comments
+    if (
+        trimmed.startsWith('@') ||
+        trimmed.startsWith('FreeRun:') ||
+        trimmed.startsWith('Final:') ||
+        trimmed.startsWith('Trq,') ||
+        /^[-\d.,]+$/.test(trimmed)
+    ) {
+        return null;
+    }
+
+    const fields = trimmed.split(/\s+/);
+
+    // Need at least 13 fields (indices 0–12)
+    if (fields.length < 13) {
+        return null;
+    }
+
+    const controllerId    = fields[0];  // e.g. "i0053"  — controller identity
+    const folder          = fields[1];  // e.g. "1a"     — internal spindle/head number
+    const program         = fields[2];
+    const unknownValue1   = fields[3];
+    const torqueDuplicate = fields[4];
+    const unknownValue2   = fields[5];
+    const unknownValue3   = fields[6];
+    const unknownValue4   = fields[7];
+    const unknownValue5   = fields[8];
+    const torque          = fields[9];
+    const judgement       = fields[10];
+    const timeDate        = `${fields[11]} ${fields[12]}`;
+
+    if (!controllerId || !folder || !timeDate || !torque) {
+        return null;
+    }
+
+    return {
+        controllerId,   // "i0053"
+        folder,         // "1a"
+        program,
+        unknownValue1,
+        torqueDuplicate,
+        unknownValue2,
+        unknownValue3,
+        unknownValue4,
+        unknownValue5,
+        torque,
+        judgement,
+        timeDate
+    };
+}
+
 // Helper function to read and parse CSV file with fast in-memory caching and zero-allocation filtering
 async function readCSVFile(filePath, filterWindow) {
     const stats = await fsp.stat(filePath);
@@ -232,36 +319,9 @@ async function readCSVFile(filePath, filterWindow) {
                 const trimmed = line.trim();
                 if (!trimmed) return;
 
-                // Fast skip for non-record lines (angle curve data, curve graph headers, summary comments)
-                if (trimmed.startsWith('@') || 
-                    trimmed.startsWith('FreeRun:') || 
-                    trimmed.startsWith('Final:') || 
-                    trimmed.startsWith('Trq,') || 
-                    /^[-\d.,]+$/.test(trimmed)) {
-                    return;
-                }
-
-                const fields = trimmed.split(/\s+/);
-                if (fields.length >= 11) {
-                    const folder = fields[0] || '';
-                    const timeDate = fields.slice(10).join(' ') || '';
-                    const torque = fields[8] || '';
-
-                    if (folder && timeDate && torque) {
-                        results.push({
-                            folder: folder,
-                            program: fields[1] || '',
-                            unknownValue1: fields[2] || '',
-                            torqueDuplicate: fields[3] || '',
-                            unknownValue2: fields[4] || '',
-                            unknownValue3: fields[5] || '',
-                            unknownValue4: fields[6] || '',
-                            unknownValue5: fields[7] || '',
-                            torque: torque,
-                            judgement: fields[9] || '',
-                            timeDate: timeDate
-                        });
-                    }
+                const record = parseYokotaLine(trimmed);
+                if (record) {
+                    results.push(record);
                 }
             });
 
@@ -314,10 +374,17 @@ async function findAllMatchingCSVFiles(baseDataPaths, stationCodes, dateString) 
         if (!(await pathExists(rootPath))) continue;
 
         for (const stnCode of stationCodes) {
+            // Always use 4-digit padded form as the directory name under /mnt/yokota/AppData/
+            // e.g. "53" → "0053", "0053" stays "0053"
+            const code4 = /^\d+$/.test(stnCode) ? stnCode.padStart(4, '0') : stnCode;
+
+            let foundForThisCode = false;
+
             // FAST PATH 1: Direct subfolder lookup from known mapping (0ms disk scan)
-            const knownSub = DEFAULT_SUBFOLDER_MAPPING[stnCode] || DEFAULT_SUBFOLDER_MAPPING[stnCode.padStart(4, '0')];
+            // Key into DEFAULT_SUBFOLDER_MAPPING is always the 4-digit padded form.
+            const knownSub = DEFAULT_SUBFOLDER_MAPPING[code4];
             if (knownSub) {
-                const directDatePath = path.join(rootPath, stnCode, knownSub, dateString);
+                const directDatePath = path.join(rootPath, code4, knownSub, dateString);
                 if (await pathExists(directDatePath)) {
                     try {
                         const files = await fsp.readdir(directDatePath);
@@ -325,19 +392,23 @@ async function findAllMatchingCSVFiles(baseDataPaths, stationCodes, dateString) 
                         for (const f of csvFiles) {
                             matchedFiles.push(path.join(directDatePath, f));
                         }
-                    } catch {}
+                        if (csvFiles.length > 0) {
+                            foundForThisCode = true;
+                        }
+                    } catch { /* ignore */ }
                 }
             }
 
-            // FAST PATH 2: Direct station folder check
-            if (matchedFiles.length === 0) {
-                const directStationPath = path.join(rootPath, stnCode);
-                if (await pathExists(directStationPath)) {
+            // FAST PATH 2: Scan the controller folder for any IP-based subdirectory
+            // (used when the hint is wrong or the mapping is missing)
+            if (!foundForThisCode) {
+                const controllerDir = path.join(rootPath, code4);
+                if (await pathExists(controllerDir)) {
                     try {
-                        const stnEntries = await fsp.readdir(directStationPath, { withFileTypes: true });
+                        const stnEntries = await fsp.readdir(controllerDir, { withFileTypes: true });
                         for (const sub of stnEntries) {
                             if (sub.isDirectory()) {
-                                const datePath = path.join(directStationPath, sub.name, dateString);
+                                const datePath = path.join(controllerDir, sub.name, dateString);
                                 if (await pathExists(datePath)) {
                                     const files = await fsp.readdir(datePath);
                                     const csvFiles = files.filter(f => f.endsWith('.csv')).sort();
@@ -347,7 +418,7 @@ async function findAllMatchingCSVFiles(baseDataPaths, stationCodes, dateString) 
                                 }
                             }
                         }
-                    } catch {}
+                    } catch { /* ignore */ }
                 }
             }
         }
@@ -363,6 +434,7 @@ async function findAllMatchingCSVFiles(baseDataPaths, stationCodes, dateString) 
 
     return uniqueFiles;
 }
+
 
 // Health check endpoint (Returns discovered base paths)
 app.get('/health', async (req, res) => {
