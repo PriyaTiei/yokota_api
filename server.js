@@ -104,23 +104,23 @@ function parseFastYokotaTimestamp(timeDateStr, referenceYear) {
 
     if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(cleanStr)) {
         const iso = cleanStr.replace(/\//g, '-');
-        const ms = Date.parse(iso);
+        const ms = new Date(iso).getTime();
         if (!isNaN(ms)) return ms;
     }
 
-    const parts = cleanStr.split(' ');
+    const parts = cleanStr.split(/\s+/);
     if (parts.length >= 2) {
-        const md = parts[0].split('/');
+        const md = parts[0].split(/[-/]/);
         if (md.length === 2) {
             const month = md[0].padStart(2, '0');
             const day = md[1].padStart(2, '0');
             const year = referenceYear || new Date().getFullYear();
-            const ms = Date.parse(`${year}-${month}-${day}T${parts[1]}`);
+            const ms = new Date(`${year}-${month}-${day} ${parts[1]}`).getTime();
             if (!isNaN(ms)) return ms;
         }
     }
 
-    const fallback = Date.parse(cleanStr);
+    const fallback = new Date(cleanStr).getTime();
     return isNaN(fallback) ? null : fallback;
 }
 
@@ -549,18 +549,25 @@ async function getStationDataHandler(req, res) {
             });
         }
 
-        // Compute safe stream filter window if startTime is provided (±5 minute safety buffer)
+        console.log(`[Yokota API Handler] Station: ${station || '(folder only)'} | Date: ${formattedDate} | Start: ${startTime || 'none'} | Next: ${nextTime || 'none'}`);
+
+        // Compute safe stream filter window if startTime is provided (±30 minute safety buffer)
         let filterWindow = null;
         if (startTime) {
-            const startMs = new Date(decodeURIComponent(startTime)).getTime();
+            const startClean = decodeURIComponent(startTime).replace('T', ' ').replace('Z', '');
+            const startMs = new Date(startClean).getTime();
             if (!isNaN(startMs)) {
-                const endTargetMs = (nextTime || endTime) 
-                    ? new Date(decodeURIComponent(nextTime || endTime)).getTime() 
-                    : (startMs + 150 * 1000);
-                const endMs = isNaN(endTargetMs) ? (startMs + 150 * 1000) : endTargetMs;
+                let endMs = startMs + 300 * 1000;
+                if (nextTime || endTime) {
+                    const endClean = decodeURIComponent(nextTime || endTime).replace('T', ' ').replace('Z', '');
+                    const endParsed = new Date(endClean).getTime();
+                    if (!isNaN(endParsed)) {
+                        endMs = endParsed;
+                    }
+                }
                 filterWindow = {
-                    safeStartMs: startMs - 5 * 60 * 1000,
-                    safeEndMs: endMs + 5 * 60 * 1000,
+                    safeStartMs: startMs - 30 * 60 * 1000, // 30-minute safety buffer
+                    safeEndMs: endMs + 30 * 60 * 1000,     // 30-minute safety buffer
                     arrivalYear: new Date(startMs).getFullYear()
                 };
             }
@@ -570,6 +577,7 @@ async function getStationDataHandler(req, res) {
         const csvFilePaths = await findAllMatchingCSVFiles(baseDataPaths, stationCodes, formattedDate);
 
         if (csvFilePaths.length === 0) {
+            console.log(`[Yokota API Handler] CSV file not found for station ${station} on date ${formattedDate}`);
             return res.status(404).json({
                 error: 'CSV file not found',
                 searchedCodes: stationCodes,
@@ -589,6 +597,8 @@ async function getStationDataHandler(req, res) {
                 combinedCsvData = combinedCsvData.concat(csvData);
             }
         }
+
+        console.log(`[Yokota API Handler] Returning ${combinedCsvData.length} records for Station ${station} on Date ${formattedDate}`);
 
         if (combinedCsvData.length === 0) {
             return res.status(404).json({
